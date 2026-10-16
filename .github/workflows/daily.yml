@@ -1,0 +1,101 @@
+name: Daily pullback tracker
+on:
+  schedule:
+    - cron: '0,30 10 * * 1-5' # KST 19:00 / 19:30 retry; execution may be delayed
+  workflow_dispatch:
+    inputs:
+      scan_date:
+        description: '과거 재계산 YYYY-MM-DD (빈 값: 최신 완료일 스캔)'
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths: ['web/**', 'scanner/**', 'tests/**', 'run.py', 'history.py', 'cloud_run.py', '.github/workflows/daily.yml']
+permissions:
+  contents: write
+concurrency:
+  group: pullback-tracker
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Tests
+        run: python -m unittest discover -s tests -v
+      - name: Scan
+        id: scan
+        continue-on-error: true
+        env:
+          SCAN_DATE: ${{ inputs.scan_date }}
+        run: |
+          if [ -n "$SCAN_DATE" ]; then
+            python history.py --date "$SCAN_DATE"
+          else
+            python cloud_run.py
+          fi
+      - name: Persist cumulative records
+        if: always() && steps.scan.outcome != 'skipped'
+        run: |
+          git config user.name 'pullback-tracker[bot]'
+          git config user.email 'pullback-tracker@users.noreply.github.com'
+          python - <<'PYCODE'
+          from pathlib import Path
+          import subprocess
+          paths=[p for p in [Path('data/tracker.db'),Path('data/last_run.json'),*Path('data').glob('universe_*.json'),Path('web/data')] if p.exists()]
+          if paths: subprocess.run(['git','add','--',*[str(p) for p in paths]],check=True)
+          PYCODE
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update cumulative price records [skip ci]'
+            git push origin HEAD:main
+          fi
+      - name: Raw responses and previous DB backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-evidence-${{ github.run_id }}
+          path: |
+            data/raw/
+            data/backup.db
+            data/last_run.json
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: Record collection outcome
+        if: always()
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+        run: echo "Collection outcome=$SCAN_OUTCOME. See data/last_run.json for full/partial status." >> "$GITHUB_STEP_SUMMARY"
+      - name: Export website
+        uses: actions/upload-artifact@v4
+        with:
+          name: radar-website
+          path: web/
+          retention-days: 7
+  deploy:
+    needs: collect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: radar-website
+          path: web
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+      - name: Publish mobile website
+        id: publish
+        uses: actions/deploy-pages@v4
